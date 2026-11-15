@@ -4,11 +4,12 @@
 // serves OpenAI clients (POST /v1/chat/completions) and Anthropic
 // clients (POST /v1/messages) from the best free model that meets each
 // request, failing over across providers inside their budget floors.
-// Routing is policy C2: candidates ranked by the sealed rating, tried
-// in arrival order, with a per-provider attempt cap, a two-strike dead
-// rule on refusals, and exactly one successful upstream call per
-// request. Every choice is a function of the brief plus live provider
-// answers; there is no clock and no randomness anywhere in this file.
+// Routing is policy C2-v2: candidates ranked by the sealed rating, then
+// re-ordered safest-first among equal ratings and pruned by a risk rule
+// (planWalk in lib/plan.ts), with a per-provider attempt cap, a
+// three-strike dead rule on refusals, and exactly one successful upstream
+// call per request. Every choice is a function of the brief plus live
+// provider answers; there is no clock and no randomness anywhere in this file.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import {
@@ -27,6 +28,7 @@ import {
   candidateLists,
   CALLS_MIN,
   parseBrief,
+  planWalk,
   readBriefFile,
   requirementsFromBody,
   type BriefProvider,
@@ -244,16 +246,16 @@ function servedModels(): Array<{ id: string; provider: string }> {
 }
 
 /** The request now arriving: its manifest row by arrival order, else the body's own hints. */
-function needsFor(body: Record<string, unknown>): { needs: NeedSet; list: Candidate[] } {
+function needsFor(body: Record<string, unknown>): { needs: NeedSet; list: Candidate[]; weight: number } {
   const row = brief.manifest[manifestCursor];
   manifestCursor += 1;
   if (row !== undefined) {
-    return { needs: row.requires, list: candidatesByRequest.get(row.id) ?? [] };
+    return { needs: row.requires, list: candidatesByRequest.get(row.id) ?? [], weight: row.weight };
   }
   const needs = requirementsFromBody(body);
   const fallback: ManifestRow = { id: '__live__', api: 'openai', stream: false, weight: 1, requires: needs };
   const list = candidateLists(brief.ratings, [fallback], brief.providers).get('__live__') ?? [];
-  return { needs, list };
+  return { needs, list, weight: 1 };
 }
 
 /** One client request body, or null when it is not one JSON object or is too large. */
@@ -294,18 +296,31 @@ function modelsRoute(req: IncomingMessage, res: ServerResponse): void {
 }
 
 /**
- * Walk one request's candidate list in ranking order. Providers that
- * are already dead, or have spent their budget floor, are passed over
- * without a call; the first HTTP 200 finishes the request; a 402, 429
- * or 5xx earns the provider a strike (a second strike retires it for
- * the rest of the trial); a 401 or 400 steps past that candidate with
- * no strike, since every call we place is well-formed by construction.
+ * Walk one request's candidate list in the order planWalk gives it (rating
+ * desc, safest-first among equal ratings, risky candidates pruned when a
+ * free ordinal-1 alternative is close). Providers that are already dead,
+ * or have spent their budget floor, are passed over without a call; the
+ * first HTTP 200 finishes the request; a 402, 429 or 5xx earns the
+ * provider a strike (a third strike retires it for the rest of the
+ * trial); a 401 or 400 steps past that candidate with no strike, since
+ * every call we place is well-formed by construction.
  */
 async function serveRequest(clientWire: ClientWire, body: Record<string, unknown>, res: ServerResponse): Promise<void> {
-  const { needs, list } = needsFor(body);
+  const { needs, list, weight } = needsFor(body);
   const wantsJson = needs.json === true;
   const streaming = body.stream === true;
+  const live: Candidate[] = [];
+  const attempts = new Map<string, number>();
   for (const candidate of list) {
+    const book = books.get(candidate.provider);
+    if (book === undefined || book.state.dead) continue;
+    const cap = CALLS_MIN[candidate.provider] ?? Number.POSITIVE_INFINITY;
+    if (book.state.attempts >= cap) continue;
+    live.push(candidate);
+    attempts.set(candidate.provider, book.state.attempts);
+  }
+  const walk = planWalk(live, attempts, weight);
+  for (const candidate of walk) {
     const book = books.get(candidate.provider);
     if (book === undefined || book.state.dead) continue;
     const cap = CALLS_MIN[candidate.provider] ?? Number.POSITIVE_INFINITY;
@@ -328,7 +343,7 @@ async function serveRequest(clientWire: ClientWire, body: Record<string, unknown
       });
     } catch {
       book.state.streak += 1;
-      if (book.state.streak >= 2) book.state.dead = true;
+      if (book.state.streak >= 3) book.state.dead = true;
       continue;
     }
     if (answer.status === 200) {
@@ -351,7 +366,7 @@ async function serveRequest(clientWire: ClientWire, body: Record<string, unknown
     }
     await answer.text().catch(() => '');
     book.state.streak += 1;
-    if (book.state.streak >= 2) book.state.dead = true;
+    if (book.state.streak >= 3) book.state.dead = true;
   }
   if (clientWire === 'anthropic') {
     sendJson(res, 503, anthropicError('api_error', 'no free model on the directory meets this request'));
