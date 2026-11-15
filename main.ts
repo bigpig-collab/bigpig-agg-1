@@ -4,12 +4,12 @@
 // serves OpenAI clients (POST /v1/chat/completions) and Anthropic
 // clients (POST /v1/messages) from the best free model that meets each
 // request, failing over across providers inside their budget floors.
-// Routing is policy C2-v2: candidates ranked by the sealed rating, then
-// re-ordered safest-first among equal ratings and pruned by a risk rule
-// (planWalk in lib/plan.ts), with a per-provider attempt cap, a
-// three-strike dead rule on refusals, and exactly one successful upstream
-// call per request. Every choice is a function of the brief plus live
-// provider answers; there is no clock and no randomness anywhere in this file.
+// Routing is policy v3: candidates ordered by expected value
+// (rating - 150 * failure risk, planWalk in lib/plan.ts), with a
+// per-provider attempt cap, a three-strike dead rule on refusals, and
+// exactly one successful upstream call per request. Every choice is a
+// function of the brief plus live provider answers; there is no clock
+// and no randomness anywhere in this file.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import {
@@ -296,17 +296,17 @@ function modelsRoute(req: IncomingMessage, res: ServerResponse): void {
 }
 
 /**
- * Walk one request's candidate list in the order planWalk gives it (rating
- * desc, safest-first among equal ratings, risky candidates pruned when a
- * free ordinal-1 alternative is close). Providers that are already dead,
- * or have spent their budget floor, are passed over without a call; the
- * first HTTP 200 finishes the request; a 402, 429 or 5xx earns the
- * provider a strike (a third strike retires it for the rest of the
- * trial); a 401 or 400 steps past that candidate with no strike, since
- * every call we place is well-formed by construction.
+ * Walk one request's candidate list in the order planWalk gives it
+ * (highest expected value first: rating minus 150 times the provider's
+ * current failure risk). Providers that are already dead, or have spent
+ * their budget floor, are passed over without a call; the first HTTP 200
+ * finishes the request; a 402, 429 or 5xx earns the provider a strike
+ * (a third strike retires it for the rest of the trial); a 401 or 400
+ * steps past that candidate with no strike, since every call we place
+ * is well-formed by construction.
  */
 async function serveRequest(clientWire: ClientWire, body: Record<string, unknown>, res: ServerResponse): Promise<void> {
-  const { needs, list, weight } = needsFor(body);
+  const { needs, list } = needsFor(body);
   const wantsJson = needs.json === true;
   const streaming = body.stream === true;
   const live: Candidate[] = [];
@@ -319,7 +319,7 @@ async function serveRequest(clientWire: ClientWire, body: Record<string, unknown
     live.push(candidate);
     attempts.set(candidate.provider, book.state.attempts);
   }
-  const walk = planWalk(live, attempts, weight);
+  const walk = planWalk(live, attempts);
   for (const candidate of walk) {
     const book = books.get(candidate.provider);
     if (book === undefined || book.state.dead) continue;
