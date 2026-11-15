@@ -463,35 +463,37 @@ export function callRisk(providerId: string, ordinal: number): number {
 }
 
 /**
- * Expected-value order for one request's walk. A candidate's key is its
- * sealed rating minus 150 times its current failure risk
- * (rating - 150 * callRisk(provider, ordinal)); the walk tries the
- * highest key first, ties broken by provider id then model id. The 150
- * was fitted on 5,000 simulated instances: it moves the ten forced
- * ordinal-2+ calls onto the low-risk providers (kilol / pollinations /
- * openrouter / groq, risk about 0.13-0.26) even at a rating cost,
- * because a failed call costs a whole extra attempt while the rating
- * given up is only tens of milli. Monte-Carlo N=5000: mean 23.40 calls
- * (v2 hybrid: 24.12), P(score 99) 0.991 (v2: 0.992), P(served 20/20)
- * 0.991; practice trials 23/21/24 (v2: 24/23/27). Lambda 140-160 is a
- * plateau with identical practice trials; 150 sits in the middle.
- *
- * The v2 skip rules are NOT applied here, because under this order they
- * can never fire: for any later ordinal-1 candidate d behind a risky
- * candidate c, the order gives rating(c) - rating(d) >= 150 * risk(c),
- * so risk(c) / earned-gap <= 1/150 < 0.015 (the old ratio threshold),
- * and the gap is >= 150 * 0.223, about 33.5 > 30 (the old earned-gap
- * threshold, since the smallest ordinal-2 risk is kilol's about 0.223).
- * The walk is the order itself, never empty when the input is not.
- * `attempts` maps provider id -> attempts used so far.
+ * Expected-value order for one request's walk, v4. A candidate's key is
+ * its sealed rating times the request weight, minus 300 times the odds
+ * of its current failure risk, minus a 50-milli price when the call
+ * would spend a fresh provider's guaranteed-success first call:
+ *   key = rating * weight - 300 * (risk / (1 - risk)) - (ordinal == 1 ? 50 : 0)
+ * The odds form is the exact greedy order for maximising expected
+ * earned rating minus 300 earned milli per expected extra call: trying
+ * candidate a before b beats the reverse order exactly when the odds
+ * key ranks a first (the pairwise-swap condition reduces to comparing
+ * rating * weight - mu * risk / (1 - risk)). The 50-milli slot price is
+ * the opportunity cost of a first call: only ten providers exist, so
+ * only ten requests can start on a guaranteed-success ordinal-1 call,
+ * and spending one early leaves a later request facing a risky
+ * ordinal-2+ start instead. Monte-Carlo N=20000: mean 22.71 calls
+ * (v3: 23.40), P(score 99) 0.993 (v3: 0.994), P(served 20/20) 0.994;
+ * practice trials 22/22/23 (v3: 23/21/24). The walk is the order
+ * itself, never empty when the input is not. `attempts` maps provider
+ * id -> attempts used so far; `weight` is the manifest weight of this
+ * request (1 or 2).
  */
 export function planWalk(
   candidates: Candidate[],
   attempts: Map<string, number>,
+  weight: number,
 ): Candidate[] {
   const scored = candidates.map((c) => {
-    const r = callRisk(c.provider, (attempts.get(c.provider) ?? 0) + 1);
-    return { c, key: c.rating - 150 * r };
+    const ordinal = (attempts.get(c.provider) ?? 0) + 1;
+    const r = callRisk(c.provider, ordinal);
+    const odds = r >= 1 ? 1e9 : r / (1 - r);
+    const slot = ordinal === 1 ? 50 : 0;
+    return { c, key: c.rating * weight - 300 * odds - slot };
   });
   scored.sort((a, b) => {
     if (a.key !== b.key) return b.key - a.key;
