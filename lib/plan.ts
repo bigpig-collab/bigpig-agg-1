@@ -105,6 +105,22 @@ export const CALLS_MIN: Record<string, number> = {
   kilol: 12,
 };
 
+/** Competition-wide per-provider budget ceilings (same sealed table). Only
+ * used to centre the per-provider risk model; the router still caps its own
+ * attempts at CALLS_MIN. */
+export const CALLS_MAX: Record<string, number> = {
+  groq: 12,
+  cerebras: 6,
+  gemini: 8,
+  zai: 5,
+  openrouter: 12,
+  sambanova: 5,
+  pollinations: 14,
+  cloudflare: 8,
+  ovh: 6,
+  kilol: 16,
+};
+
 type AnyRecord = Record<string, unknown>;
 
 function isRecord(value: unknown): value is AnyRecord {
@@ -428,4 +444,80 @@ export function requirementsFromBody(body: unknown): NeedSet {
     if (kind === 'json_object' || kind === 'json_schema') needs.json = true;
   }
   return needs;
+}
+
+/**
+ * Per-provider failure risk of a call at the given ordinal (1-based attempt
+ * number on that provider). Ordinal 1 can never fail on the scheduled
+ * failure model (the kit's draw only schedules failures at ordinals >= 2),
+ * so its risk is 0. Ordinal 2 carries a small extra term for the
+ * forced-failure provider. Beyond that the risk falls as the provider's
+ * average budget grows: a provider with a small budget has few ordinals,
+ * so each ordinal past 1 is likelier to be a scheduled failure. The
+ * 0.1 / 1.6 constants were fitted on 5,000 simulated instances.
+ */
+export function callRisk(providerId: string, ordinal: number): number {
+  if (ordinal <= 1) return 0;
+  const avg = ((CALLS_MIN[providerId] ?? 10) + (CALLS_MAX[providerId] ?? 12)) / 2;
+  return (ordinal === 2 ? 0.1 : 0) + 1.6 / (avg - 2);
+}
+
+/** Skip a risky candidate when its risk / earned-gap ratio exceeds this. */
+const RATIO_THETA = 0.015;
+/** Skip a risky candidate when the earned rating gap to an ordinal-1
+ * alternative is at most this many milli. */
+const EARNED_GAP = 30;
+
+/**
+ * Order a live candidate list into the walk for one request and drop the
+ * candidates that are not worth attempting. The walk is ordered by rating
+ * desc, then current risk asc (equal-rated candidates are tried
+ * safest-first), then provider asc, then model asc. A risky candidate is
+ * skipped when a later ordinal-1 alternative exists and EITHER
+ *  (a) risk / earned-gap > RATIO_THETA (the failure risk outweighs the
+ *      rating gap it protects), or
+ *  (b) the earned gap (rating gap x request weight) is <= EARNED_GAP
+ *      (the rating at stake is small enough to take the free alternative).
+ * The last live candidate is never skipped, so the walk always has at
+ * least one candidate. `attempts` maps provider id -> attempts used so far.
+ */
+export function planWalk(
+  candidates: Candidate[],
+  attempts: Map<string, number>,
+  weight: number,
+): Candidate[] {
+  const sorted = [...candidates].sort((a, b) => {
+    if (a.rating !== b.rating) return b.rating - a.rating;
+    const ra = callRisk(a.provider, (attempts.get(a.provider) ?? 0) + 1);
+    const rb = callRisk(b.provider, (attempts.get(b.provider) ?? 0) + 1);
+    if (ra !== rb) return ra - rb;
+    if (a.provider !== b.provider) return a.provider < b.provider ? -1 : 1;
+    return a.model < b.model ? -1 : a.model > b.model ? 1 : 0;
+  });
+  const kept: Candidate[] = [];
+  for (let i = 0; i < sorted.length; i++) {
+    const c = sorted[i];
+    if (i === sorted.length - 1) { kept.push(c); break; }
+    const oc = (attempts.get(c.provider) ?? 0) + 1;
+    const rc = callRisk(c.provider, oc);
+    if (rc <= 0) { kept.push(c); continue; }
+    let bestOrd1: Candidate | null = null;
+    for (let j = i + 1; j < sorted.length; j++) {
+      const d = sorted[j];
+      if ((attempts.get(d.provider) ?? 0) === 0 && (bestOrd1 === null || d.rating > bestOrd1.rating)) bestOrd1 = d;
+    }
+    let skip = false;
+    if (bestOrd1 !== null) {
+      const gapEarned = (c.rating - bestOrd1.rating) * weight;
+      if (gapEarned > 0 && rc / gapEarned > RATIO_THETA) skip = true;
+    }
+    if (!skip && oc >= 2) {
+      for (let j = i + 1; j < sorted.length; j++) {
+        const d = sorted[j];
+        if ((c.rating - d.rating) * weight <= EARNED_GAP && (attempts.get(d.provider) ?? 0) === 0) { skip = true; break; }
+      }
+    }
+    if (!skip) kept.push(c);
+  }
+  return kept.length > 0 ? kept : sorted.slice(-1);
 }
